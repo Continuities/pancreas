@@ -2,11 +2,21 @@
 #include <FastLED.h>
 #include <DmxSimple.h>
 
-#define N_INPUTS 6
-static const uint8_t analog_pins[] = {A3,A2,A1,A0,A4,A5};
+#define DEBUG_FADERS false
+#define DEBUG_PULSE true
+#define PULSE_MODE true
+#define N_INPUTS 5
+static const uint8_t fader_pins[] = {A3,A2,A1,A0,A4};
+static const uint8_t pulse_pin = A5;
 #define SAMPLES 10
 #define BAUD 57600
 #define SEND_INTERVAL 100 // ms
+
+typedef struct hsv {
+  uint8_t h;
+  uint8_t s;
+  uint8_t v;
+} hsv;
 
 typedef struct movingAvg {
   int values[SAMPLES];
@@ -34,7 +44,6 @@ void setup() {
   DmxSimple.maxChannel(8);
 
   Serial.begin(BAUD);
-
 }
 
 unsigned long last_send_time = 0;
@@ -42,108 +51,107 @@ unsigned long last_send_time = 0;
 enum states {UP, DOWN};
 int state;
 int16_t place_in_span;
-
-int hue;
-int sat;
-int val;
 uint16_t singleStrobeCounter;
 uint16_t doubleStrobeCounter;
 int prev_spd;
+uint16_t low_pulse = 9999999;
+uint16_t high_pulse = 0;
 
-void loop() {
-  int v[N_INPUTS];
-
-  for (int i = 0; i < N_INPUTS; i++) {
-     int raw = map(analogRead(analog_pins[i]), 1023, 0, 0, 1023);
-     v[i] = compute_avg(&avgs[i], raw);
+/** COLOUR MODES **/
+hsv handle_pulse() {
+  uint16_t data = analogRead(pulse_pin);
+  if (DEBUG_PULSE) {
+    Serial.println(data);
   }
 
-  if (millis() - last_send_time >= SEND_INTERVAL) {
-    last_send_time += SEND_INTERVAL;
-
-    Serial.print("cat ");
-    for (int i = 0; i < N_INPUTS; i++) {
-      Serial.print(v[i]);
-      Serial.print(' ');
-    }
-    Serial.print("meow\n");
+  if (data < low_pulse) {
+    low_pulse = data;
   }
 
-  int mode = v[0];
+  if (data > high_pulse) {
+    high_pulse = data;
+  }
 
-  if (mode < 256) {
-    // Colour fade
-    int hue1 = map(v[1], 0, 1023, 0, 255);
-    int spd = map(v[2], 0, 1023, 32, 2048);
-    int hue2 = map(v[3], 0, 1023, 0, 255);
-    //sat = map(v[4], 0, 1023, 0, 255);
-    sat = 255;
+  return {
+    .h = 0,
+    .s = 255,
+    .v = map(data, low_pulse, high_pulse, 0, 255)
+  };
+  
+}
 
-    if (hue1 > hue2) {
-      int swap = hue1;
-      hue1 = hue2;
-      hue2 = swap;
-    }
+hsv colour_fade(int v[]) {
+  int hue1 = map(v[1], 0, 1023, 0, 255);
+  int spd = map(v[2], 0, 1023, 32, 2048);
+  int hue2 = map(v[3], 0, 1023, 0, 255);
 
-    int16_t scaled_span = (hue2 - hue1) * 128;
+  if (hue1 > hue2) {
+    int swap = hue1;
+    hue1 = hue2;
+    hue2 = swap;
+  }
 
-    if (state == UP) {
-      place_in_span += scaled_span / spd;
-    } else if (state == DOWN) {
-      place_in_span -= scaled_span / spd;
-    } else {
-      // shouldn't happen, so let's fix it
-      state = UP;
-    }
+  int16_t scaled_span = (hue2 - hue1) * 128;
 
-    if (place_in_span > scaled_span) {
-      state = DOWN;
-    } else if (place_in_span < 0) {
-      state = UP;
-    }
-
-    hue = hue1 + place_in_span / 256;
-    val = 255;
-  } else if (mode < 640) {
-    // Single colour strobe
-    int spd = map(v[2], 0, 1023, 1, 75);
-    hue = map(v[1], 0, 1023, 0, 255);
-    sat = map(v[3], 0, 1023, 0, 255);
-
-    if (spd != prev_spd) {
-      singleStrobeCounter = singleStrobeCounter % (2*prev_spd);
-      prev_spd = spd;
-    }
-
-    singleStrobeCounter++;
-    if((singleStrobeCounter % (2*spd)) < spd) {
-      val = 255;
-    } else {
-      val = 0;
-    }
+  if (state == UP) {
+    place_in_span += scaled_span / spd;
+  } else if (state == DOWN) {
+    place_in_span -= scaled_span / spd;
   } else {
-    // Dual colour strobe
-    int spd = map(v[2], 0, 1023, 1, 75);
-    int hue1 = map(v[1], 0, 1023, 0, 255);
-    int hue2 = map(v[3], 0, 1023, 0, 255);
-
-    if (spd != prev_spd) {
-      doubleStrobeCounter = doubleStrobeCounter % (2*prev_spd);
-      prev_spd = spd;
-    }
-
-    doubleStrobeCounter++;
-    if((doubleStrobeCounter % (2*spd)) < spd) {
-      hue = hue1;
-    } else {
-      hue = hue2;
-    }
-
-    sat = 255;
-    val = 255;
+    // shouldn't happen, so let's fix it
+    state = UP;
   }
 
-  const CRGB& rgb = CHSV(hue, sat, val);
+  if (place_in_span > scaled_span) {
+    state = DOWN;
+  } else if (place_in_span < 0) {
+    state = UP;
+  }
+
+  return {
+    .h = hue1 + place_in_span / 256,
+    .s = 255,
+    //.s = map(v[4], 0, 1023, 0, 255),
+    .v = 255
+  };
+}
+
+hsv single_strobe(int v[]) {
+  int spd = map(v[2], 0, 1023, 1, 75);
+  
+  if (spd != prev_spd) {
+    singleStrobeCounter = singleStrobeCounter % (2*prev_spd);
+    prev_spd = spd;
+  }
+
+  return {
+    .h = map(v[1], 0, 1023, 0, 255),
+    .s = map(v[3], 0, 1023, 0, 255),
+    .v = (++singleStrobeCounter % (2*spd)) < spd ? 255 : 0
+  };
+}
+
+hsv dual_strobe(int v[]) {
+  int spd = map(v[2], 0, 1023, 1, 75);
+  int hue1 = map(v[1], 0, 1023, 0, 255);
+  int hue2 = map(v[3], 0, 1023, 0, 255);
+
+  if (spd != prev_spd) {
+    doubleStrobeCounter = doubleStrobeCounter % (2*prev_spd);
+    prev_spd = spd;
+  }
+
+  return {
+    .h = (++doubleStrobeCounter % (2*spd)) < spd ? hue1 : hue2,
+    .s = 255,
+    .v = 255
+  };
+}
+
+/** END COLOUR MODES **/
+
+void do_the_colour_thing(hsv colour) {
+  const CRGB& rgb = CHSV(colour.h, colour.s, colour.v);
 
   // ColorKey
   DmxSimple.write(1, rgb.r);
@@ -156,6 +164,40 @@ void loop() {
   DmxSimple.write(6, rgb.g);
   DmxSimple.write(7, rgb.b);
   DmxSimple.write(8, 0);
+}
+
+void loop() {
+  int v[N_INPUTS];
+
+  for (int i = 0; i < N_INPUTS; i++) {
+     int raw = map(analogRead(fader_pins[i]), 1023, 0, 0, 1023);
+     v[i] = compute_avg(&avgs[i], raw);
+  }
+
+  if (DEBUG_FADERS && millis() - last_send_time >= SEND_INTERVAL) {
+    last_send_time += SEND_INTERVAL;
+
+    Serial.print("cat ");
+    for (int i = 0; i < N_INPUTS; i++) {
+      Serial.print(v[i]);
+      Serial.print(' ');
+    }
+    Serial.print("meow\n");
+  }
+
+  int mode = v[0];
+  hsv colour;
+  if (PULSE_MODE) {
+    colour = handle_pulse();
+  } else if (mode < 256) {
+    colour = colour_fade(v);
+  } else if (mode < 640) {
+    colour = single_strobe(v);
+  } else {
+    colour = dual_strobe(v);
+  }
+
+  do_the_colour_thing(colour);
 
   // wait for the ADC to settle (at least 2 ms):
   delay(2);
