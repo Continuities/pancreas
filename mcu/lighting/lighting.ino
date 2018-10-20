@@ -4,10 +4,10 @@
 #include <MIDIUSB.h>
 
 #define DEBUG_FADERS false
-#define DEBUG_PULSE false
+#define DEBUG_PULSE true
+#define DEBUG_BPM false
 #define PULSE_MODE true
 #define MIDI_PULSE true
-#define PULSE_THRESHOLD 240
 #define N_INPUTS 5
 #define SAMPLES 10
 #define PULSE_SAMPLE_RATE 100 // ms
@@ -21,7 +21,11 @@
 #define MIDI_CHANNEL 0
 #define MIDI_PITCH 48 // middle c
 #define MIDI_VELOCITY 64
-#define MAX_PULSE 128
+#define PULSE_BRIGHTNESS 128
+#define PULSE_THRESHOLD 220
+#define PULSES_FROM_NOISE 4
+#define BPM_LOW 30
+#define BPM_HIGH 160
 
 static const uint8_t fader_pins[] = {A3, A2, A1, A0, A4};
 static const uint8_t pulse_pin = A5;
@@ -45,7 +49,9 @@ movingAvg avgs[N_INPUTS] = {0};
 movingAvg pulse_avg;
 unsigned long last_send_time = 0;
 unsigned long last_pulse_sample = 0;
+unsigned long last_pulse = 0;
 int state;
+int pulse_counter = 0;
 int16_t place_in_span;
 uint16_t singleStrobeCounter;
 uint16_t doubleStrobeCounter;
@@ -54,7 +60,8 @@ int pulse_low = 9999;
 int pulse_high = 0;
 int next_pulse_low = 9999;
 int next_pulse_high = 0;
-bool sent_midi = false;
+bool pulse_up = false;
+bool noise = true;
 
 void setup() {
   DmxSimple.usePin(3);  // double rainbow shield
@@ -86,22 +93,48 @@ void loop() {
 
   int pulse = normalize_pulse(analogRead(pulse_pin));
 
-  if (MIDI_PULSE) {
-    if (!sent_midi && pulse > PULSE_THRESHOLD) {
+  if (!pulse_up && pulse > PULSE_THRESHOLD) {
+    int bpm = 60000 / (millis() - last_pulse);
+    if (bpm > BPM_LOW && bpm < BPM_HIGH) {
+      if (++pulse_counter > 2 * PULSES_FROM_NOISE) {
+        pulse_counter = 2 * PULSES_FROM_NOISE;
+      }
+    }
+    else {
+      if (--pulse_counter < 0) {
+        pulse_counter = 0;
+      }
+    }
+    noise = pulse_counter < PULSES_FROM_NOISE;
+
+    if (DEBUG_BPM) {
+      Serial.print(bpm);
+      Serial.print(' ');
+      Serial.println(noise);
+    }
+    
+    last_pulse = millis();
+    if (MIDI_PULSE && !noise) {
       sendMidiBeat();
-      sent_midi = true;
     }
-    else if (sent_midi && pulse < PULSE_THRESHOLD) {
-      sent_midi = false;
-    }
+    pulse_up = true;
+  }
+  else if (pulse_up && pulse < PULSE_THRESHOLD) {
+    pulse_up = false;
   }
 
   int mode = v[0];
   hsv colour;
-  if (PULSE_MODE) {
-//    simple_pulse(pulse);
-//    dual_fade_pulse(pulse);
-    triple_fade_pulse(pulse);
+  if (PULSE_MODE && !noise) {
+    if (mode < 256) {
+      simple_pulse(pulse); 
+    }
+    else if (mode < 640) {
+      dual_fade_pulse(pulse); 
+    }
+    else {
+      triple_fade_pulse(pulse);
+    }
   } else if (mode < 256) {
     colour_fade(v);
   } else if (mode < 640) {
@@ -118,11 +151,6 @@ void sendMidiBeat() {
   midiEventPacket_t noteOn = {0x09, 0x90 | MIDI_CHANNEL, MIDI_PITCH, MIDI_VELOCITY};
   MidiUSB.sendMIDI(noteOn);
   MidiUSB.flush();
-}
-
-void noteOff(byte channel, byte pitch, byte velocity) {
-  midiEventPacket_t noteOff = {0x08, 0x80 | channel, pitch, velocity};
-  MidiUSB.sendMIDI(noteOff);
 }
 
 void set_colour(hsv colour, int base_channel) {
@@ -157,7 +185,7 @@ int normalize_pulse(int raw) {
   if (raw > pulse_high) { pulse_high = raw; }
   if (raw > next_pulse_high) { next_pulse_high = raw; }
 
-  int normalized = map(raw, pulse_low, pulse_high, 0, MAX_PULSE);
+  int normalized = map(raw, pulse_low, pulse_high, 0, 255);
 
   if (DEBUG_PULSE) {
     Serial.print(normalized);
@@ -177,7 +205,7 @@ void simple_pulse(int normalized_pulse) {
   set_colour({
     .h = 0,
     .s = 255,
-    .v = normalized_pulse
+    .v = max(0, map(normalized_pulse, 32, 255, 0, PULSE_BRIGHTNESS))
   }, LIGHT_1);
 }
 
@@ -185,39 +213,38 @@ void dual_fade_pulse(int normalized_pulse) {
   set_colour({
     .h = 223,
     .s = 255,
-    .v = MAX_PULSE - normalized_pulse  
+    .v = max(0, map(normalized_pulse, 0, 196, PULSE_BRIGHTNESS, 0))
   }, LIGHT_1);
 
   set_colour({
     .h = 0,
     .s = 255,
-    .v = normalized_pulse
+    .v = max(0, map(normalized_pulse, 32, 255, 0, PULSE_BRIGHTNESS))
   }, LIGHT_2);
 }
 
 void triple_fade_pulse(int normalized_pulse) {
 
-  int hue = map(normalized_pulse, 0, MAX_PULSE, 220, 400);
-  if (hue > 255) {
-    hue = 0; 
-  }
+  int l1 = max(0, map(normalized_pulse, 0, 128, 255, 0));
+  int l2 = normalized_pulse <= 96 ? max(0, min(255, map(normalized_pulse, 32, 96, 0, 255))) : max(0, min(255, map(normalized_pulse, 96, 160, 255, 0)));
+  int l3 = max(0, map(normalized_pulse, 96, 255, 0, 255));
   
   set_colour({
-    .h = hue,
+    .h = 240,
     .s = 255,
-    .v = max(0, map(normalized_pulse, 0, MAX_PULSE / 2, MAX_PULSE, 0))
+    .v = map(l1, 0, 255, 0, PULSE_BRIGHTNESS / 2)
   }, LIGHT_1);
 
   set_colour({
-    .h = hue,
+    .h = 0,
     .s = 255,
-    .v = normalized_pulse <= MAX_PULSE / 2 ? min(MAX_PULSE, map(normalized_pulse, 0, MAX_PULSE / 2, 0, MAX_PULSE)) : min(MAX_PULSE, map(normalized_pulse, MAX_PULSE / 2, MAX_PULSE, MAX_PULSE, 0))
+    .v =  map(l2, 0, 255, 0, PULSE_BRIGHTNESS / 2)
   }, LIGHT_2);
 
   set_colour({
-    .h = hue,
+    .h = 0,
     .s = 255,
-    .v = max(0, map(normalized_pulse, MAX_PULSE / 2, MAX_PULSE, 0, MAX_PULSE))
+    .v =  map(l3, 0, 255, 0, PULSE_BRIGHTNESS)
   }, LIGHT_3);
 }
 
